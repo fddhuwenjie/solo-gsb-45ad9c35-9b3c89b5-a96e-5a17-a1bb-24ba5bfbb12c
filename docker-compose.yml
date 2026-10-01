@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: tou-pricing-api:latest
+    container_name: tou-pricing-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "sqlite:////data/tariff.db"
+    volumes:
+      - tariff-data:/data
+    restart: unless-stopped
+
+volumes:
+  tariff-data:

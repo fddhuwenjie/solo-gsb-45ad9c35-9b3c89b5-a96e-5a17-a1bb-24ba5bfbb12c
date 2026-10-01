@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+data/
+*.db
+tests/
+.pytest_cache/
+README.md
