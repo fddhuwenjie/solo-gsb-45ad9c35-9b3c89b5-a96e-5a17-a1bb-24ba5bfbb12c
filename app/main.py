@@ -6,12 +6,12 @@ from decimal import ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from . import (
-    allocation, demand, diff, estimate, importer, meter, pricing, settlement,
-    shiftplan,
+    allocation, backup, demand, diff, estimate, importer, meter, pricing,
+    settlement, shiftplan,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -23,6 +23,7 @@ from .pricing import (
 )
 from .schemas import (
     AllocationMemberOut,
+    BackupResponse,
     CostAllocationRequest,
     CostAllocationResponse,
     DemandAllocationOut,
@@ -173,6 +174,40 @@ def get_cycle(cycle_id: str):
     """查看账期当前结算状态：revision、账期总量/总额、各批次摘要与全部
     已合并的 UTC 用量区间（可用于重启后接续与对账）。"""
     return settlement.get_cycle(cycle_id)
+
+
+@app.post("/backups/{backup_id}", response_model=BackupResponse,
+          status_code=201, tags=["backups"])
+def post_backup(backup_id: str, response: Response):
+    """提交一个**服务运行期间**的可迁移 SQLite 快照备份。
+
+    通过 SQLite Online Backup API 在**独立连接**上把当前库复制到备份目录
+    的临时文件（分批复制，写入期间 /quote、/cycles/{id}/batches 等请求
+    继续工作，无需暂停报价或结算）；副本完成后用另一条独立连接执行
+    ``PRAGMA integrity_check``，并计算 SHA-256 与字节数，校验通过后**原子
+    发布**到数据卷的备份目录。同一 ``backup_id`` 的重放（含并发请求）返回
+    **首次元数据**（HTTP 200），并发只发布一个最终文件；已有备份不可
+    覆盖；失败或校验不通过会删除临时文件，不留半成品。
+    """
+    body, created = backup.create_backup(backup_id)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@app.get("/backups/{backup_id}", response_model=BackupResponse, tags=["backups"])
+def get_backup(backup_id: str):
+    """查看某次备份的元数据（下载地址、SHA-256、字节数、发布时间）。"""
+    return backup.get_backup(backup_id)
+
+
+@app.get("/backups/{backup_id}/download", tags=["backups"])
+def download_backup(backup_id: str):
+    """下载已发布的 SQLite 快照（``application/vnd.sqlite3``）。"""
+    path = backup.backup_file_path(backup_id)
+    return FileResponse(
+        path, media_type="application/vnd.sqlite3",
+        filename=path.name)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,

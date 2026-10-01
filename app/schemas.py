@@ -690,3 +690,16 @@ class SettlementBatchResponse(BaseModel):
         ..., description="账期全部区间合并后用计价引擎整体重算的完整报价"
     )
 
+
+# ---------------------------------------------------------------- backups
+
+
+class BackupResponse(BaseModel):
+    backup_id: str = Field(..., description="调用方提交的备份 ID（也是最终文件名）")
+    filename: str = Field(..., description="备份目录内发布的快照文件名")
+    download_url: str = Field(
+        ..., description="快照下载地址（相对路径，application/vnd.sqlite3）")
+    sha256: str = Field(..., description="副本的 SHA-256 摘要（hex）")
+    size_bytes: int = Field(..., description="副本字节数")
+    created_at: str = Field(..., description="首次发布时间（UTC ISO-8601，带 Z）")
+

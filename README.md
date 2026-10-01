@@ -17,11 +17,13 @@ docker compose up --build
 - 健康检查：http://localhost:8000/health
 
 SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tariff.db`），
-首次启动自动建表并写入预置规则版本。
+首次启动自动建表并写入预置规则版本；在线备份默认发布到卷内
+`/data/backups/`（`POST /backups/{backup_id}`）。
 
 > 不用 Docker 也可以：
 > `pip install -r requirements.txt && uvicorn app.main:app --port 8000`
-> （默认使用本地 `./data/tariff.db`，可用环境变量 `DATABASE_URL` 覆盖）
+> （默认使用本地 `./data/tariff.db`，可用环境变量 `DATABASE_URL` 覆盖；
+> 备份默认发布到数据库文件旁的 `backups/`，可用 `BACKUP_DIR` 覆盖）
 
 ## 预置规则版本
 
@@ -49,6 +51,9 @@ SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tari
   `POST /cycles/{id}/batches` 的账期累计状态（锁定的规则版本、当前
   revision、未舍入累计金额）、每批幂等登记（幂等键、内容摘要、首次响应
   体、本批金额）与已合并的 UTC 用量区间。
+- `database_backups`：`POST /backups/{id}` 的备份登记（`backup_id`、
+  已发布文件名、SHA-256、字节数、发布时间），用于同 id 重放返回首次
+  元数据与重启后查询；快照文件本身在备份目录（卷内 `/data/backups/`）。
 
 规则在 `app/database.py` 的 `SEED_VERSIONS` 中声明，改完后清空数据库卷重启即可重新播种：
 
@@ -971,6 +976,52 @@ UTC 用量区间（带所属 revision、全局序号），用于重启后接续�
 curl -s localhost:8000/cycles/demo-2024-07
 ```
 
+### `POST /backups/{backup_id}` / `GET /backups/{backup_id}` / 下载
+
+服务运行期间导出**可迁移的 SQLite 快照**，供离线核对——**不暂停报价或
+结算**：通过 **SQLite Online Backup API** 在**独立连接**上把当前库分批
+复制到备份目录下的临时文件（批间让出写锁，`/quote`、
+`/cycles/{id}/batches` 等请求继续工作）；副本完成后用另一条独立连接执行
+`PRAGMA integrity_check`，并流式计算副本的 **SHA-256 与字节数**，全部
+通过后以**原子方式发布**（同卷硬链接）为 `{backup_id}.db`。
+
+- `backup_id` 只允许 1～128 个字母、数字、`.`、`_`、`-`（非法返回 400
+  `invalid_backup_id`），它同时是最终文件名，防止路径穿越。
+- 首次成功返回 **201**；**同一 `backup_id` 的重放（包括并发请求）返回
+  首次元数据（200）**，不重新备份。并发请求按 `backup_id` 串行，配合
+  登记行的原子插入，**只发布一个最终文件**。
+- **已有备份不可覆盖**：最终文件已存在且校验通过时直接采用（如进程在
+  登记前崩溃后重试）；已存在文件无法通过完整性检查则返回 **409
+  `backup_exists`**。
+- 备份失败或 integrity_check 不通过时**删除临时文件、不留半成品**，
+  也不写入登记。
+
+备份目录默认在数据库文件旁的 `backups/`（Docker 卷内即
+`/data/backups`，随卷持久化），可用环境变量 `BACKUP_DIR` 覆盖。
+
+```bash
+curl -s -X POST localhost:8000/backups/2026-10-01-nightly
+```
+
+```json
+{
+  "backup_id": "2026-10-01-nightly",
+  "filename": "2026-10-01-nightly.db",
+  "download_url": "/backups/2026-10-01-nightly/download",
+  "sha256": "039ae9a10fb989c58210cf508e7fff1edcc626dc9bc30884734a0688376f5c96",
+  "size_bytes": 94208,
+  "created_at": "2026-10-01T06:32:57.846154Z"
+}
+```
+
+- `GET /backups/{backup_id}`：查看首次登记的元数据（不存在 404
+  `backup_not_found`）。
+- `GET /backups/{backup_id}/download`：下载快照（Content-Type
+  `application/vnd.sqlite3`），离线侧可用返回的 `sha256` 与 `size_bytes`
+  核对下载结果；该文件是自包含的单文件 SQLite 库（副本已切回
+  `DELETE` 日志模式并检查点，无 `-wal/-shm` 侧车），可直接用
+  `sqlite3 2026-10-01-nightly.db 'PRAGMA integrity_check;'` 独立核对。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
@@ -988,6 +1039,9 @@ curl -s localhost:8000/cycles/demo-2024-07
 | POST | `/usage-estimate` | 账单金额已知、用量缺失时反推用量区间：恒定功率假设 + 0.000001 网格 Decimal 二分定位目标金额平台两端，无解时区分超过可达上界与舍入跳跃（见上） |
 | POST | `/cycles/{cycle_id}/batches` | 账期分批用量的持久化增量结算：expected_revision 乐观锁 + 幂等重放、UTC 合并且禁重叠、账期整体重算让累计阶梯贯穿各批次（见上） |
 | GET | `/cycles/{cycle_id}` | 查看账期当前 revision、累计总量/总额、批次摘要与全部 UTC 区间（见上） |
+| POST | `/backups/{backup_id}` | 在线 SQLite 快照：Online Backup API 独立连接分批复制、integrity_check + SHA-256/字节数校验后原子发布；同 id 重放首次元数据、并发只发布一个文件、已有备份不可覆盖（见上） |
+| GET | `/backups/{backup_id}` | 查看某次备份的下载地址、SHA-256、字节数与发布时间 |
+| GET | `/backups/{backup_id}/download` | 下载已发布的 SQLite 快照（`application/vnd.sqlite3`） |
 
 ## 错误处理
 
@@ -1014,6 +1068,12 @@ curl -s localhost:8000/cycles/demo-2024-07
 | 409 | `idempotency_conflict` | 同一账期内幂等键已用于不同的提交内容（同键重放必须与首次完全一致） |
 | 409 | `version_locked` | 账期首次提交已锁定规则版本，后续批次提交了不同的 `version` |
 | 404 | `cycle_not_found` | `GET /cycles/{cycle_id}` 查询的账期不存在 |
+| 400 | `invalid_backup_id` | 备份 ID 含非法字符（仅字母数字、点、下划线、短横线，1～128 字符） |
+| 404 | `backup_not_found` / `backup_file_missing` | 备份未登记，或登记指向的快照文件已不在备份目录 |
+| 409 | `backup_exists` | 同名最终文件已存在但无法通过完整性检查；已有备份不可覆盖 |
+| 409 | `backup_conflict` | 备份登记已存在且对应不同内容（摘要/字节数/文件名不一致） |
+| 409 | `backup_in_flight` | 同一 `backup_id` 的另一个备份在等待上限内仍未完成 |
+| 500 | `backup_integrity_failed` / `backup_journal_mode_failed` | 副本 `integrity_check` 不为 `ok`，或副本无法收敛为自包含单文件；临时文件已删除 |
 | 422 | `invalid_import` | `/versions/import` 字段校验失败；`details.errors` 逐条给出 JSON 定位路径 |
 | 422 | `invalid_rule` | 版本内规则字段（时区/时间/档位数值）无法解析 |
 | 422 | `incompatible_versions` | `/quote-diff` 的两版币种或能量单位不同，拒绝比较 |
@@ -1063,7 +1123,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 162 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 172 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -1094,7 +1154,14 @@ rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选�
 内容/旧 revision/换版本冲突、跨批 UTC 区间重叠、规则缺口与非法区间
 不写入任何批次/幂等记录/revision、同 revision 并发（线程级两请求、
 新建账期竞争与 8 路竞争）只有一个生效且无半成品、重启后状态恢复/
-重放/接续提交，以及 HTTP 端到端的 201/200/404/409 响应。
+重放/接续提交，以及 HTTP 端到端的 201/200/404/409 响应。在线备份
+（文件库 + 真实写锁）覆盖：Online Backup 在线复制期间 `/quote` 读与
+账期批次写持续成功且快照自包含可开、integrity_check 与 SHA-256/字节数
+核对、同 `backup_id` 5 路并发只发布一个文件且元数据一致、重放返回首次
+结果、校验失败删除临时文件且无登记/无半成品并可重试、同名文件拒绝
+覆盖（损坏文件 409、有效文件采用补登记）、非法 ID 400 与未知 ID 404、
+重启后元数据可查可重放，以及 HTTP 的 201/200/404/400、下载内容与摘要
+一致、备份进行中 `/quote` 不受影响。
 
 ## 目录结构
 
@@ -1112,7 +1179,10 @@ app/
   importer.py   # 版本导入：规范化、SHA-256 摘要、定位校验、单事务落库
   settlement.py # 账期增量结算：幂等重放、expected_revision 乐观锁、
                 #   UTC 区间合并、账期整体重算、SQLite 持久化与重启接续
-  database.py   # SQLAlchemy 模型（账期/批次/区间表）与预置版本数据
+  backup.py     # 在线 SQLite 快照：Online Backup API 独立连接分批复制、
+                #   integrity_check + SHA-256/字节数校验、原子发布（不可
+                #   覆盖）、同 id 重放与并发单文件
+  database.py   # SQLAlchemy 模型（账期/批次/区间/备份表）与预置版本数据
 tests/          # pytest 端到端测试
 Dockerfile
 docker-compose.yml

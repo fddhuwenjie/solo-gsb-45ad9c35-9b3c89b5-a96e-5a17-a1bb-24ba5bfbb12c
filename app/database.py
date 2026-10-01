@@ -239,6 +239,23 @@ class CycleInterval(Base):
     cycle: Mapped[BillingCycle] = relationship(back_populates="intervals")
 
 
+class DatabaseBackup(Base):
+    """在线备份登记：``backup_id`` -> 已发布快照文件与校验摘要。
+
+    备份流程通过 SQLite Online Backup API 复制到临时文件、integrity_check
+    通过后原子发布（硬链接，不可覆盖），最后在本表登记首次元数据；同一
+    ``backup_id`` 的重放（含并发）原样返回此登记，重启后同样有效。
+    """
+
+    __tablename__ = "database_backups"
+
+    backup_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255))  # 备份目录内文件名
+    sha256: Mapped[str] = mapped_column(String(64))  # 副本 SHA-256 hex
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 def init_db() -> None:
     db_path = _database_url()
     if db_path.startswith("sqlite:///") and ":memory:" not in db_path:
