@@ -6,12 +6,12 @@ from decimal import ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from . import (
-    allocation, demand, diff, estimate, importer, meter, pricing, settlement,
-    shiftplan,
+    allocation, backup, demand, diff, estimate, importer, meter, pricing,
+    settlement, shiftplan,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -23,6 +23,7 @@ from .pricing import (
 )
 from .schemas import (
     AllocationMemberOut,
+    BackupResponse,
     CostAllocationRequest,
     CostAllocationResponse,
     DemandAllocationOut,
@@ -62,6 +63,8 @@ from .schemas import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 对齐上次崩溃可能留下的孤儿登记行/临时副本，保证启动即干净。
+    backup.reconcile_backups()
     yield
 
 
@@ -90,6 +93,75 @@ async def pricing_error_handler(request: Request, exc: PricingError):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ------------------------------------------------------------------ backups
+
+
+@app.post("/backups/{backup_id}", response_model=BackupResponse, tags=["backups"])
+def post_backup(backup_id: str, response: Response):
+    """服务不暂停的前提下生成可迁移 SQLite 快照。
+
+    通过 SQLite Online Backup API 在**独立连接**上把在线库增量复制到备份
+    目录的临时文件；复制期间 ``/quote``、``/cycles/{id}/batches`` 等请求
+    照常工作。副本完成后用另一条独立连接执行 ``PRAGMA integrity_check``，
+    并计算 SHA-256 与字节数；校验通过后以**原子链接**发布为
+    ``<backup_id>.db``，返回下载地址与摘要。
+
+    首次成功返回 **201**；同一 ``backup_id`` 的重放（含并发请求）返回
+    **首次元数据（200）**，已发布备份不可被覆盖（409）；任何复制或校验
+    失败都会删除临时文件，不留下半成品。
+    """
+    result = backup.create_backup(backup_id)
+    if not result.created:
+        response.status_code = 200
+    else:
+        response.status_code = 201
+    return result.metadata
+
+
+@app.get("/backups/{backup_id}", response_model=BackupResponse, tags=["backups"])
+def get_backup(backup_id: str):
+    """查询已发布备份的元数据（下载地址、SHA-256、字节数）；不存在 404。"""
+    meta = backup.get_backup(backup_id)
+    if meta is None:
+        raise PricingError(
+            f"备份不存在: {backup_id}", code="backup_not_found",
+            status_code=404, details={"backup_id": backup_id})
+    return meta
+
+
+@app.get("/backups/{backup_id}/download", tags=["backups"])
+def download_backup(backup_id: str):
+    """下载已发布的 SQLite 副本（``application/vnd.sqlite3``）。
+
+    仅在备份目录内按登记文件名发送；未发布的备份返回 404。
+    """
+    import os
+
+    from .database import DatabaseBackup
+
+    backup.validate_backup_id(backup_id)
+    with Session(engine) as session:
+        row = session.get(DatabaseBackup, backup_id)
+        if row is None:
+            raise PricingError(
+                f"备份不存在: {backup_id}", code="backup_not_found",
+                status_code=404, details={"backup_id": backup_id})
+        path = os.path.join(backup.backup_dir(), row.filename)
+        if not os.path.isfile(path):
+            raise PricingError(
+                f"备份文件缺失: {backup_id}", code="backup_file_missing",
+                status_code=410, details={"backup_id": backup_id})
+        return FileResponse(
+            path,
+            media_type="application/vnd.sqlite3",
+            filename=row.filename,
+            headers={
+                "Content-Length": str(row.size_bytes),
+                "X-Backup-SHA256": row.sha256,
+            },
+        )
 
 
 @app.get("/versions", response_model=list[VersionOut], tags=["versions"])

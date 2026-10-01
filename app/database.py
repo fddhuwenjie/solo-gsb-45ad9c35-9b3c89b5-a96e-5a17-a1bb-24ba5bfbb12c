@@ -239,6 +239,24 @@ class CycleInterval(Base):
     cycle: Mapped[BillingCycle] = relationship(back_populates="intervals")
 
 
+class DatabaseBackup(Base):
+    """在线备份登记：backup_id -> 已发布备份文件的摘要元数据。
+
+    由 ``POST /backups/{backup_id}`` 在**原子发布文件之前**写入：同一
+    backup_id 的重放直接返回本行（HTTP 200），并发请求中只有一个能成功
+    插入（主键冲突者重放或冲突），已发布备份因此不可覆盖。备份文件本身
+    位于数据卷的备份目录，重启后仍可凭本行定位与核对。
+    """
+
+    __tablename__ = "database_backups"
+
+    backup_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 def init_db() -> None:
     db_path = _database_url()
     if db_path.startswith("sqlite:///") and ":memory:" not in db_path:
